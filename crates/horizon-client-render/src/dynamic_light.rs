@@ -55,22 +55,34 @@ impl Luminance {
 pub struct Source {
     pub at: DVec3,
     pub level: u8,
+    /// Linear RGB tint, in the 0..=1 range.
+    pub color: [f32; 3],
 }
 
 /// The [`MAX`] sources nearest `camera` within reach, as the shaders read them: camera-relative
 /// position and level. Overwrites `out`.
-pub fn select(sources: &[Source], camera: DVec3, out: &mut Vec<[f32; 4]>) {
+pub fn select(sources: &[Source], camera: DVec3, out: &mut Vec<[f32; 4]>, colors: &mut Vec<[f32; 4]>) {
     out.clear();
+    colors.clear();
     let key = |s: &Source| s.at.distance_squared(camera);
     let mut near: Vec<&Source> = sources
         .iter()
         .filter(|s| s.level > 0 && key(s) <= REACH * REACH)
         .collect();
-    near.sort_by(|a, b| key(a).total_cmp(&key(b)));
-    out.extend(near.into_iter().take(MAX).map(|s| {
+    // When there are many possible emitters, partition to the nearest MAX
+    // first instead of sorting every candidate. The render path only consumes
+    // MAX entries, so ordering the discarded tail is wasted work. Sorting the
+    // retained prefix keeps the uniform data deterministic and nearest-first.
+    if near.len() > MAX {
+        near.select_nth_unstable_by(MAX, |a, b| key(a).total_cmp(&key(b)));
+        near.truncate(MAX);
+    }
+    near.sort_unstable_by(|a, b| key(a).total_cmp(&key(b)));
+    for s in near {
         let p = (s.at - camera).as_vec3();
-        [p.x, p.y, p.z, f32::from(s.level.min(15))]
-    }));
+        out.push([p.x, p.y, p.z, f32::from(s.level.min(15))]);
+        colors.push([s.color[0], s.color[1], s.color[2], 1.0]);
+    }
 }
 
 /// The block light a vertex at `pos` (camera-relative) gets from `lights`, 0 to 15: the WGSL
@@ -94,23 +106,29 @@ mod tests {
             .map(|i| Source {
                 at: camera + DVec3::new(f64::from(i), 0.0, 0.0),
                 level: 14,
+                color: [1.0, 0.65, 0.25],
             })
             .collect();
         sources.push(Source {
             at: camera + DVec3::new(0.5, 0.0, 0.0),
             level: 0,
+            color: [1.0; 3],
         });
         sources.push(Source {
             at: camera + DVec3::new(0.0, 0.0, 200.0),
             level: 15,
+            color: [1.0, 0.3, 0.1],
         });
         let mut out = Vec::new();
-        select(&sources, camera, &mut out);
+        let mut colors = Vec::new();
+        select(&sources, camera, &mut out, &mut colors);
         assert_eq!(out.len(), MAX);
+        assert_eq!(colors.len(), MAX);
         assert_eq!(out[0], [0.0, 0.0, 0.0, 14.0]);
         assert_eq!(out[MAX - 1][0], (MAX - 1) as f32);
-        select(&[], camera, &mut out);
+        select(&[], camera, &mut out, &mut colors);
         assert!(out.is_empty());
+        assert!(colors.is_empty());
     }
 
     #[test]

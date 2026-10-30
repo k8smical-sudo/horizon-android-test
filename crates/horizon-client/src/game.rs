@@ -1539,6 +1539,8 @@ struct Game<'a> {
     /// Horizon Extras' dynamic lights this frame (`dynamic_lights.rs`), and how brightly each
     /// item glows (built the first time the extra is on).
     dynamic_lights: Vec<[f32; 4]>,
+    /// RGB tint of each of `dynamic_lights` (game/dynamic_lights.rs).
+    dynamic_light_colors: Vec<[f32; 4]>,
     luminance: Option<horizon_client::dynamic_light::Luminance>,
     /// Name tags drawn over everything (`RenderPipelines.TEXT_SEE_THROUGH`).
     see_through_vertices: Vec<Vertex>,
@@ -11052,13 +11054,16 @@ impl Game<'_> {
         self.ui.chat.set_abilities(&self.gui.atlas.font, abilities);
         self.streaming.radius = self.settings.render_distance;
         // Options.biomeBlendRadius, ambientOcclusion and cutoutLeaves:
-        // LevelExtractor.allChanged when they change.
+        // LevelExtractor.allChanged when they change. Close-up greedy meshing
+        // follows the shader pack choice (see `shader_packs.rs`).
         let (s, st) = (&self.settings, &self.streaming);
         let remesh = (s.biome_blend, s.smooth_lighting, s.cutout_leaves)
-            != (st.biome_blend, st.smooth_lighting, st.cutout_leaves);
+            != (st.biome_blend, st.smooth_lighting, st.cutout_leaves)
+            || st.greedy_meshing != s.horizon.shader_pack.is_empty();
         self.streaming.biome_blend = self.settings.biome_blend;
         self.streaming.smooth_lighting = self.settings.smooth_lighting;
         self.streaming.cutout_leaves = self.settings.cutout_leaves;
+        self.streaming.greedy_meshing = self.settings.horizon.shader_pack.is_empty();
         if remesh {
             self.all_sections_changed();
         }
@@ -12349,6 +12354,7 @@ impl Game<'_> {
             entity_spans: &entity_spans,
             glowing: &glowing,
             dynamic_lights: &self.dynamic_lights,
+            dynamic_light_colors: &self.dynamic_light_colors,
             lightning: horizon_client::gfx::lightning::Input {
                 bolts: &bolts,
                 uv: [
@@ -14647,6 +14653,7 @@ impl<'a> Game<'a> {
             renderer: None,
             entity_vertices: Vec::new(),
             dynamic_lights: Vec::new(),
+            dynamic_light_colors: Vec::new(),
             luminance: None,
             see_through_vertices: Vec::new(),
             entity_spans: Default::default(),
@@ -15700,6 +15707,7 @@ pub(crate) fn loading_frame(hud: &HudBatch) -> Frame<'_> {
         entity_spans: &[],
         glowing: &[],
         dynamic_lights: &[],
+        dynamic_light_colors: &[],
         clouds: None,
         lightning: Default::default(),
         additive: &[],

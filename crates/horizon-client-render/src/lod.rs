@@ -1205,16 +1205,43 @@ impl Lod {
             selected.retain(|key| key.level != 0 || !self.covered.contains(&(key.x, key.z)));
             let next: FxHashSet<_> = selected.iter().copied().collect();
             let changed: Vec<_> = self.active.symmetric_difference(&next).copied().collect();
+            // A naive scan compares every selected tile against every changed
+            // tile. During a large LOD replan that is quadratic and can stall
+            // the frame even though the actual changes are spatially local.
+            // Sort changed rectangles by their left edge and use a prefix
+            // maximum of right edges to skip rectangles that cannot touch.
+            let mut changed_rects: Vec<_> = changed
+                .iter()
+                .map(|key| {
+                    let [x, _, z] = key.origin();
+                    let size = key.size();
+                    (x, x + size, z, z + size)
+                })
+                .collect();
+            changed_rects.sort_unstable_by_key(|rect| rect.0);
+            let mut prefix_max_x1 = Vec::with_capacity(changed_rects.len());
+            let mut max_x1 = i32::MIN;
+            for rect in &changed_rects {
+                max_x1 = max_x1.max(rect.1);
+                prefix_max_x1.push(max_x1);
+            }
             for &tile in &next {
                 let [x, _, z] = tile.origin();
                 let size = tile.size();
-                if changed.iter().any(|other| {
-                    let [ox, _, oz] = other.origin();
-                    let os = other.size();
-                    (x < ox + os && ox < x + size && z < oz + os && oz < z + size)
-                        || (((x + size == ox) || (ox + os == x)) && z < oz + os && oz < z + size)
-                        || (((z + size == oz) || (oz + os == z)) && x < ox + os && ox < x + size)
-                }) {
+                let x1 = x + size;
+                let z1 = z + size;
+                // `upper` excludes rectangles whose left edge is beyond this
+                // tile. `lower` skips the prefix whose right edges are all to
+                // its left. The exact overlap/edge-adjacency test below is
+                // unchanged, so no extra tiles are invalidated.
+                let upper = changed_rects.partition_point(|rect| rect.0 <= x1);
+                let lower = prefix_max_x1[..upper].partition_point(|end| *end < x);
+                let touches = changed_rects[lower..upper].iter().any(|&(ox, ox1, oz, oz1)| {
+                    (x < ox1 && ox < x1 && z < oz1 && oz < z1)
+                        || ((x1 == ox || ox1 == x) && z < oz1 && oz < z1)
+                        || ((z1 == oz || oz1 == z) && x < ox1 && ox < x1)
+                });
+                if touches {
                     self.dirty.insert(tile);
                 }
             }

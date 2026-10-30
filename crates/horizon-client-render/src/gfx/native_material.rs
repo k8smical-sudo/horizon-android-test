@@ -51,7 +51,7 @@ fn horizon_material_vertex(position: vec3<f32>, uv: vec2<f32>, layer: u32, color
     @location(0) position: vec3<f32>, @location(1) uv: vec2<u32>,
     @location(2) layer: u32, @location(3) color: vec4<f32>, @location(4) light: vec2<u32>,
     @location(5) origin: vec4<f32>) -> HorizonMaterialOut {
-    return horizon_material_vertex(position, horizon_terrain_terrain_uv(uv, origin.w), layer,
+    return horizon_material_vertex(position, horizon_terrain_terrain_uv(uv, origin.w, layer), layer,
         color, light, origin.xyz);
 }
 @vertex fn horizon_material_vs_flat(
@@ -60,11 +60,11 @@ fn horizon_material_vertex(position: vec3<f32>, uv: vec2<f32>, layer: u32, color
     @location(2) layer: u32, @location(3) color: vec4<f32>, @location(4) light: vec2<u32>
 ) -> HorizonMaterialOut {
     let origin = horizon_terrain_slot_origins[horizon_terrain_block_slots[vertex >> 8u]];
-    return horizon_material_vertex(position, horizon_terrain_terrain_uv(uv, origin.w), layer,
+    return horizon_material_vertex(position, horizon_terrain_terrain_uv(uv, origin.w, layer), layer,
         color, light, origin.xyz);
 }
 fn horizon_material_color(in: HorizonMaterialOut, translucent: bool) -> vec4<f32> {
-    let albedo = horizon_terrain_sprite(in.uv, in.layer & 0x7fffu);
+    let albedo = horizon_terrain_sprite(in.uv, in.layer & 0x3fffu);
     return material(MaterialInput(albedo, in.tint, in.light, in.lightmap, in.position, in.uv,
         translucent)).color;
 }

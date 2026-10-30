@@ -8,7 +8,7 @@ use crate::{
 use horizon_assets::model::Direction;
 use horizon_core::position::BlockPos;
 use horizon_world::registry::BlockStateId;
-use std::collections::BTreeMap;
+use std::hash::{Hash, Hasher};
 
 const CELLS: usize = 16;
 
@@ -231,7 +231,21 @@ struct Rect {
     u1: f32,
     v1: f32,
 }
-type Faces = BTreeMap<FaceKey, Vec<Rect>>;
+// Hashing is cheaper than maintaining a tree while every exposed face is added.
+// The entries are sorted by `FaceKey` before emission below, preserving the old
+// deterministic mesh/vertex order exactly.
+impl Hash for FaceKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        (self.direction as u8).hash(state);
+        self.plane.hash(state);
+        self.overlay.hash(state);
+        self.layer.hash(state);
+        self.light.hash(state);
+        self.color.hash(state);
+        self.translucent.hash(state);
+    }
+}
+type Faces = crate::fast_hash::FxHashMap<FaceKey, Vec<Rect>>;
 fn add_face(faces: &mut Faces, direction: Direction, plane: f32, rect: Rect, material: Material) {
     for (overlay, paint) in material.faces.into_iter().enumerate() {
         let Some(paint) = paint else { continue };
@@ -305,26 +319,32 @@ fn mesh_columns_with_edges(
     let stride = key.size() / CELLS as i32;
     let [ox, _, oz] = key.origin();
     // A cell meets full-detail or finer terrain: it is meshed in smaller steps.
-    let cell_step = |x: usize, z: usize| {
+    // Compute this once per cell: both gap filling and face generation need the
+    // same value, and the finer-tile scan is comparatively expensive.
+    let cell_steps: [i32; CELLS * CELLS] = std::array::from_fn(|i| {
+        let (x, z) = (i % CELLS, i / CELLS);
         let (wx, wz) = (ox + x as i32 * stride, oz + z as i32 * stride);
         let overlaps = covered_bounds.is_some_and(|[x0, z0, x1, z1]| {
             wx < x1 && wx + stride > x0 && wz < z1 && wz + stride > z0
         });
         let mut step = if overlaps { stride.min(16) } else { stride };
         for other in finer {
-            let [x, _, z] = other.origin();
-            if wx < x + other.size() && x < wx + stride && wz < z + other.size() && z < wz + stride
+            let [fx, _, fz] = other.origin();
+            if wx < fx + other.size()
+                && fx < wx + stride
+                && wz < fz + other.size()
+                && fz < wz + stride
             {
                 step = step.min(other.size());
             }
         }
         step
-    };
+    });
     let filled = fill_buried_gaps(
         columns,
         neighbors,
         stride,
-        |x, z| cell_step(x, z) == stride,
+        |x, z| cell_steps[z * CELLS + x] == stride,
         |span| material(span, Direction::Up).fluid != 0,
     );
     let prepared: Vec<Vec<Segment<'_>>> = filled
@@ -367,7 +387,7 @@ fn mesh_columns_with_edges(
                 .collect()
         })
         .collect();
-    let mut faces = Faces::new();
+    let mut faces = Faces::default();
     let finer_keys: FxHashSet<_> = finer.iter().copied().collect();
     let mut finer_levels: Vec<_> = finer.iter().map(|key| key.level).collect();
     finer_levels.sort_unstable();
@@ -386,7 +406,7 @@ fn mesh_columns_with_edges(
     for z in 0..CELLS {
         for x in 0..CELLS {
             let (wx, wz) = (ox + x as i32 * stride, oz + z as i32 * stride);
-            let step = cell_step(x, z);
+            let step = cell_steps[z * CELLS + x];
             let column = &prepared[z * CELLS + x];
             let own_sky = column.last().map_or(0, |top| top.span.light & 0xff);
             for dz in (0..stride).step_by(step as usize) {
@@ -552,7 +572,11 @@ fn mesh_columns_with_edges(
         }
     }
     let mut mesh = SectionMesh::default();
-    for (key, mut rects) in faces {
+    // Keep the same stable key order as the former BTreeMap implementation so
+    // the optimization changes the cost of accumulation, not the rendered mesh.
+    let mut entries: Vec<_> = faces.into_iter().collect();
+    entries.sort_unstable_by_key(|(key, _)| *key);
+    for (key, mut rects) in entries {
         merge(&mut rects);
         for rect in rects {
             emit(&mut mesh, key, rect)

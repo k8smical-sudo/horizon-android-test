@@ -9,9 +9,12 @@ impl Game<'_> {
     /// glowing dropped items, the nearest [`dynamic_light::MAX`] of them.
     pub(super) fn gather_dynamic_lights(&mut self, camera: DVec3, alpha: f64) {
         let mut out = std::mem::take(&mut self.dynamic_lights);
+        let mut colors = std::mem::take(&mut self.dynamic_light_colors);
         out.clear();
+        colors.clear();
         if !self.settings.extras.dynamic_lights {
             self.dynamic_lights = out;
+            self.dynamic_light_colors = colors;
             return;
         }
         if self.luminance.is_none() {
@@ -19,6 +22,26 @@ impl Game<'_> {
         }
         let lum = self.luminance.as_ref().expect("built above");
         let held = |item: Option<&str>| item.map_or(0, |i| lum.of(i));
+        let tint = |item: Option<&str>, burning: bool| -> [f32; 3] {
+            if burning {
+                [1.0, 0.28, 0.06]
+            } else {
+                let name = item.unwrap_or("");
+                if name.contains("soul_torch") || name.contains("soul_lantern") || name.contains("soul_fire") {
+                    [0.20, 0.62, 1.0]
+                } else if name.contains("redstone_torch") {
+                    [1.0, 0.12, 0.06]
+                } else if name.contains("lava") {
+                    [1.0, 0.24, 0.04]
+                } else if name.contains("sea_lantern") || name.contains("prismarine") {
+                    [0.30, 0.85, 1.0]
+                } else if name.contains("end_rod") {
+                    [0.78, 0.65, 1.0]
+                } else {
+                    [1.0, 0.68, 0.32]
+                }
+            }
+        };
         let mut sources = Vec::new();
         if let Some(p) = &self.player
             && !p.spectator
@@ -30,10 +53,14 @@ impl Game<'_> {
                 .max(held(self.stack_in(shield::OFFHAND_SLOT).map(|s| &*s.item)))
                 .max(if p.fire_ticks > 0 { BURNING } else { 0 });
             // About where the hands are.
-            sources.push(Source {
-                at: DVec3::new(feet.x, feet.y + 1.2, feet.z),
-                level,
-            });
+            if level > 0 {
+                let item = self.stack_in(self.selected).map(|s| &*s.item);
+                sources.push(Source {
+                    at: DVec3::new(feet.x, feet.y + 1.2, feet.z),
+                    level,
+                    color: tint(item, p.fire_ticks > 0),
+                });
+            }
         }
         for m in self.mobs.iter().filter(|m| !m.removed) {
             let level = held(m.extra.main_hand.as_deref())
@@ -43,9 +70,11 @@ impl Game<'_> {
                 continue;
             }
             let at = m.previous.lerp(m.position, alpha);
+            let item = m.extra.main_hand.as_deref().or(m.extra.off_hand.as_deref());
             sources.push(Source {
                 at: DVec3::new(at.x, at.y + f64::from(m.height()) * 0.6, at.z),
                 level,
+                color: tint(item, m.fire_ticks > 0),
             });
         }
         for item in &self.dropped {
@@ -59,9 +88,11 @@ impl Game<'_> {
             sources.push(Source {
                 at: DVec3::new(at.x, at.y + 0.25, at.z),
                 level,
+                color: tint(Some(&item.stack.item), item.fire_ticks > 0),
             });
         }
-        dynamic_light::select(&sources, camera, &mut out);
+        dynamic_light::select(&sources, camera, &mut out, &mut colors);
         self.dynamic_lights = out;
+        self.dynamic_light_colors = colors;
     }
 }

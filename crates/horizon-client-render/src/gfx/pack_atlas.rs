@@ -172,7 +172,7 @@ impl PackAtlas {
         // The colour's alpha holds HDR's emission level (`mesher::EMISSION_BITS`): packs get 1.
         let body = format!(
             "    vec4 hz_origin = {origin};\n    \
-             uint hz_layer = hz_v_layer & 32767u;\n    \
+             uint hz_layer = hz_v_layer & 16383u;\n    \
              hz_cell = vec2(float(hz_layer % {columns}u), float(hz_layer / {columns}u));\n    \
              hz_scale = vec2({:?}, {:?});\n    \
              hz_Vertex = vec4(hz_v_pos + hz_origin.xyz, 1.0);\n    \

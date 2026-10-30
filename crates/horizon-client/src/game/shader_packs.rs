@@ -38,6 +38,19 @@ impl Game<'_> {
         static DEV_PACK: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
         let dev = DEV_PACK.get_or_init(|| std::env::var("HORIZON_SHADER_PACK").ok());
         let picked = dev.as_deref().unwrap_or(&self.settings.horizon.shader_pack);
+        // Third-party shader packs receive atlas UVs and expect one sprite per
+        // quad. Close-up greedy quads use repeating array-layer UVs, so fall back
+        // to the ordinary model mesher while any pack is selected, and remesh the
+        // loaded sections when crossing that boundary.
+        let greedy_meshing = picked.is_empty();
+        if self.streaming.greedy_meshing != greedy_meshing {
+            self.streaming.greedy_meshing = greedy_meshing;
+            for &(x, z) in self.world.chunks.keys() {
+                for sy in 0..horizon_client::chunk::HEIGHT / 16 {
+                    self.world.dirty_sections.insert((x, sy, z));
+                }
+            }
+        }
         if self.native_shaders.picked != picked {
             // Another pack, or none: drop what ran.
             self.native_shaders = super::native_shaders::NativeShaders::picking(picked);

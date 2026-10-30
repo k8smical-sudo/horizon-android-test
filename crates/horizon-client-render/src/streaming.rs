@@ -158,6 +158,7 @@ struct MeshSettings {
     blend_radius: i32,
     smooth_lighting: bool,
     cutout_leaves: bool,
+    greedy_meshing: bool,
 }
 enum Job {
     Generate(i32, i32),
@@ -275,6 +276,8 @@ pub struct Streaming {
     /// The `ao` and `cutoutLeaves` options.
     pub smooth_lighting: bool,
     pub cutout_leaves: bool,
+    /// Close-up greedy meshing for Horizon's native terrain renderer.
+    pub greedy_meshing: bool,
     /// Incremental relighting of block edits on lit chunks (see `light::relight`).
     light_tables: Arc<LightTables>,
     /// Applied edits by sequence, replayed onto light jobs snapshotted before them.
@@ -543,6 +546,7 @@ impl Streaming {
                                         blend_radius: settings.blend_radius,
                                         smooth_lighting: settings.smooth_lighting,
                                         cutout_leaves: settings.cutout_leaves,
+                                        greedy_meshing: settings.greedy_meshing,
                                         assets: &context.assets,
                                         render: &context.render,
                                         tables: &context.tables,
@@ -607,6 +611,7 @@ impl Streaming {
             biome_blend: 2,
             smooth_lighting: true,
             cutout_leaves: true,
+            greedy_meshing: true,
             light_tables,
             light_log: Vec::new(),
             light_edit_sequence: 0,
@@ -1298,6 +1303,7 @@ impl Streaming {
                             blend_radius: self.biome_blend,
                             smooth_lighting: self.smooth_lighting,
                             cutout_leaves: self.cutout_leaves,
+                            greedy_meshing: self.greedy_meshing,
                         },
                     ),
                 );

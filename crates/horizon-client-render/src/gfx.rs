@@ -208,6 +208,8 @@ struct Globals {
     outline_params: [f32; 4],
     /// Horizon Extras' dynamic lights: camera-relative position and level (`dynamic_light`).
     dynamic_lights: [[f32; 4]; crate::dynamic_light::MAX],
+    /// RGB tint of each dynamic light, in the same order as `dynamic_lights`.
+    dynamic_light_colors: [[f32; 4]; crate::dynamic_light::MAX],
     /// The sunrise fan's triangles as the sky shader tests them (`sunrise_fan::normals`).
     sunrise_fan: [[f32; 4]; 2 * sunrise_fan::TRIANGLES],
 }
@@ -307,6 +309,8 @@ pub struct Frame<'a> {
     pub weather_time: crate::weather::Time,
     /// Horizon Extras' dynamic lights, nearest first (`dynamic_light::select`); empty when off.
     pub dynamic_lights: &'a [[f32; 4]],
+    /// RGB tint of each of `dynamic_lights`.
+    pub dynamic_light_colors: &'a [[f32; 4]],
     /// Cloud mesh inputs; geometry and GPU storage are retained by the renderer.
     pub clouds: Option<crate::clouds::Input<'a>>,
     /// Retained lightning bolts, drawn before the other additive entities.
@@ -4090,6 +4094,13 @@ impl Renderer {
                     *to = *from;
                 }
                 lights
+            },
+            dynamic_light_colors: {
+                let mut colors = [[0.0; 4]; crate::dynamic_light::MAX];
+                for (to, from) in colors.iter_mut().zip(frame.dynamic_light_colors) {
+                    *to = *from;
+                }
+                colors
             },
             sunrise_fan: sunrise_fan::normals(frame.sky.sunrise_color[3], sun),
         };

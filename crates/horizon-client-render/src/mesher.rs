@@ -22,7 +22,7 @@ use horizon_world::{
     registry::BlockStateId,
 };
 pub use sides::Sides;
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
 /// An entity, item and effect vertex (the entity pipelines), with a face
 /// normal for `entity.wgsl`'s directional light.
@@ -73,6 +73,11 @@ pub const UV_STEPS: f32 = 32768.0;
 /// Fixed-point steps per block of distant-terrain UVs (`TerrainVertex::tiled`),
 /// which span `[0, 2048)`: merged faces repeat their sprite once per block.
 pub const TILED_UV_STEPS: f32 = 32.0;
+/// `TerrainVertex::layer` bit selecting block-scaled UVs for close-up greedy
+/// quads. Sprite array indices are limited to the lower 14 bits by the
+/// renderer's eight 2048-layer arrays; bit 15 remains `OPAQUE_LAYER`.
+pub const TILED_UV_LAYER: u16 = 1 << 14;
+
 impl TerrainVertex {
     pub fn new(pos: [f32; 3], uv: [f32; 2], layer: u16, color: u32, light: u16) -> Self {
         Self {
@@ -94,6 +99,21 @@ impl TerrainVertex {
             color,
         }
     }
+    /// A close-up greedy face. The vertex shader recognizes `TILED_UV_LAYER`
+    /// and decodes this UV with the block-scaled step without changing the
+    /// instance format used by ordinary model quads.
+    pub fn tiled_section(
+        pos: [f32; 3],
+        uv: [f32; 2],
+        layer: u16,
+        color: u32,
+        light: u16,
+    ) -> Self {
+        let mut vertex = Self::tiled(pos, uv, layer, color, light);
+        vertex.layer |= TILED_UV_LAYER;
+        vertex
+    }
+
     /// The UV the GPU samples.
     pub fn uv(&self) -> [f32; 2] {
         self.uv.map(|v| f32::from(v) / UV_STEPS)
@@ -344,12 +364,15 @@ impl MeshTables {
         facts: &BlockFacts,
         visibility: FaceVisibility,
     ) -> crate::Result<Self> {
-        // Terrain vertices keep the sprite layer below `OPAQUE_LAYER`.
+        // Bit 14 selects tiled UVs and bit 15 marks opaque texels, so real
+        // sprite layers must fit in the lower 14 bits.
         let layers = render.sprite_layers.values().max().map_or(0, |l| l + 1);
-        if layers > u32::from(OPAQUE_LAYER) {
-            return Err(
-                format!("{layers} block sprites, terrain vertices index {OPAQUE_LAYER}").into(),
-            );
+        if layers > u32::from(TILED_UV_LAYER) {
+            return Err(format!(
+                "{layers} block sprites, terrain vertices reserve layer bits above {}",
+                TILED_UV_LAYER - 1
+            )
+            .into());
         }
         let layer = |name: &str| -> crate::Result<u16> {
             render
@@ -719,7 +742,177 @@ pub struct Mesher<'a> {
     pub smooth_lighting: bool,
     /// The `cutoutLeaves` option (fancy graphics); off makes leaves opaque.
     pub cutout_leaves: bool,
+    /// Native-renderer close-up greedy meshing. Disabled while a shader pack
+    /// is active because third-party atlas shaders assume one sprite per quad.
+    pub greedy_meshing: bool,
 }
+/// A single exposed side of an exact unit cube. Faces only share a key when
+/// their material, projected UV transform, colour and light all agree, so a
+/// merged quad cannot erase a texture, tint, AO or light boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct GreedyKey {
+    direction: u8,
+    plane: u8,
+    layer: u16,
+    uv: [i8; 6],
+    color: u32,
+    light: u16,
+}
+
+type GreedyFaces = BTreeMap<GreedyKey, Vec<(u8, u8)>>;
+type GreedyDirection = horizon_assets::model::Direction;
+
+fn greedy_axes(direction: GreedyDirection) -> (usize, usize, usize) {
+    match direction {
+        GreedyDirection::Down | GreedyDirection::Up => (1, 0, 2),
+        GreedyDirection::North | GreedyDirection::South => (2, 0, 1),
+        GreedyDirection::West | GreedyDirection::East => (0, 2, 1),
+    }
+}
+
+fn positive_face(direction: GreedyDirection) -> bool {
+    matches!(
+        direction,
+        GreedyDirection::Up | GreedyDirection::South | GreedyDirection::East
+    )
+}
+
+fn add_greedy_face(
+    faces: &mut GreedyFaces,
+    direction: GreedyDirection,
+    pos: [i32; 3],
+    style: crate::models::CubeStyle,
+    vertices: &[TerrainVertex; 4],
+) -> bool {
+    // A rectangle has only four corners. Merge only flat-lit faces so all
+    // original per-vertex attributes remain exactly representable. Also make
+    // sure the baked face layer agrees with the cube classifier's source layer.
+    if (vertices[0].layer & 0x3fff) != style.layer as u16 || vertices
+        .iter()
+        .any(|v| v.color != vertices[0].color || v.light != vertices[0].light)
+    {
+        return false;
+    }
+    let (axis, u_axis, v_axis) = greedy_axes(direction);
+    let plane = pos[axis] + if positive_face(direction) { 1 } else { 0 };
+    debug_assert!((0..=16).contains(&plane));
+    let key = GreedyKey {
+        direction: direction as u8,
+        plane: plane as u8,
+        layer: vertices[0].layer,
+        uv: style.uv,
+        color: vertices[0].color,
+        light: vertices[0].light,
+    };
+    faces
+        .entry(key)
+        .or_default()
+        .push((pos[u_axis] as u8, pos[v_axis] as u8));
+    true
+}
+
+fn emit_greedy_rect(
+    mesh: &mut SectionMesh,
+    key: GreedyKey,
+    u0: u8,
+    v0: u8,
+    width: u8,
+    height: u8,
+) {
+    let direction = GreedyDirection::ALL[key.direction as usize];
+    let (_axis, u_axis, v_axis) = greedy_axes(direction);
+    let plane = f32::from(key.plane);
+    let u0 = f32::from(u0);
+    let v0 = f32::from(v0);
+    let u1 = u0 + f32::from(width);
+    let v1 = v0 + f32::from(height);
+    let mut points = match direction {
+        GreedyDirection::Down | GreedyDirection::Up => [
+            [u0, plane, v1],
+            [u1, plane, v1],
+            [u1, plane, v0],
+            [u0, plane, v0],
+        ],
+        GreedyDirection::North | GreedyDirection::South => [
+            [u0, v1, plane],
+            [u1, v1, plane],
+            [u1, v0, plane],
+            [u0, v0, plane],
+        ],
+        GreedyDirection::West | GreedyDirection::East => [
+            [plane, v1, u1],
+            [plane, v1, u0],
+            [plane, v0, u0],
+            [plane, v0, u1],
+        ],
+    };
+    if matches!(
+        direction,
+        GreedyDirection::Down | GreedyDirection::South | GreedyDirection::East
+    ) {
+        points.reverse();
+    }
+
+    // CubeStyle maps the spatial (u,v) face coordinates to the source
+    // sprite. Extending that affine mapping across blocks repeats the sprite
+    // once per block, including mirrored and quarter-turned variants.
+    let [a, b, du, dv, eu, ev] = key.uv.map(f32::from);
+    let mut uvs = points.map(|point| {
+        let face_u = point[u_axis] - u0;
+        let face_v = point[v_axis] - v0;
+        [a + du * face_u + eu * face_v, b + dv * face_u + ev * face_v]
+    });
+    let origin = [0, 1].map(|i| {
+        uvs.iter()
+            .map(|uv| uv[i])
+            .fold(f32::INFINITY, f32::min)
+            .floor()
+    });
+    for uv in &mut uvs {
+        uv[0] -= origin[0];
+        uv[1] -= origin[1];
+    }
+    mesh.solid.extend(points.into_iter().zip(uvs).map(|(pos, uv)| {
+        TerrainVertex::tiled_section(pos, uv, key.layer, key.color, key.light)
+    }));
+}
+
+/// Greedily covers each coplanar material/light-compatible face mask with
+/// maximal rectangles. One cell represents one block side; the rectangle's
+/// UVs repeat per block and its vertices retain the exact common attributes.
+fn emit_greedy_faces(mesh: &mut SectionMesh, faces: GreedyFaces) {
+    for (key, cells) in faces {
+        let mut mask = [[false; 16]; 16];
+        for (u, v) in cells {
+            mask[usize::from(v)][usize::from(u)] = true;
+        }
+        for v in 0..16usize {
+            for u in 0..16usize {
+                if !mask[v][u] {
+                    continue;
+                }
+                let mut width = 1;
+                while u + width < 16 && mask[v][u + width] {
+                    width += 1;
+                }
+                let mut height = 1;
+                'rows: while v + height < 16 {
+                    for x in u..u + width {
+                        if !mask[v + height][x] {
+                            break 'rows;
+                        }
+                    }
+                    height += 1;
+                }
+                for row in &mut mask[v..v + height] {
+                    row[u..u + width].fill(false);
+                }
+                emit_greedy_rect(mesh, key, u as u8, v as u8, width as u8, height as u8);
+            }
+        }
+    }
+}
+
 impl Mesher<'_> {
     /// `region[dz][dx]` are the chunks around the meshed column (centre 1,1).
     pub fn mesh(&mut self, region: &[[Option<&Chunk>; 3]; 3], sy: i32) -> SectionMesh {
@@ -742,6 +935,7 @@ impl Mesher<'_> {
         let info = &self.tables.info;
         let catalog = &self.render.model_catalog;
         let mut models = Vec::new();
+        let mut greedy_faces = GreedyFaces::new();
         for y in 0..16 {
             for z in 0..16 {
                 for x in 0..16 {
@@ -783,7 +977,8 @@ impl Mesher<'_> {
                         continue;
                     };
                     let ao = self.smooth_lighting && state.emission == 0 && first.ambient_occlusion;
-                    let origin = match offset(state, world.x, world.z) {
+                    let block_offset = offset(state, world.x, world.z);
+                    let origin = match block_offset {
                         Some(o) => [
                             x as f32 + o[0] as f32,
                             y as f32 + o[1] as f32,
@@ -809,26 +1004,78 @@ impl Mesher<'_> {
                                 )
                                 .unwrap_or(true);
                     }
-                    for model in &models {
-                        for face in &model.faces {
-                            if face.quad.cull.is_some_and(|d| !visible[d as usize]) {
+                    // Only exact, unshifted, opaque unit cubes are candidates.
+                    // Multi-part models, fluids, animated/offset blocks,
+                    // tinted or emissive materials retain their original path.
+                    let cube = if self.greedy_meshing
+                        && state.solid
+                        && state.fluid.kind() == FluidKind::Empty
+                        && state.emission == 0
+                        && !state.emissive
+                        && block_offset.is_none()
+                        && models.len() == 1
+                    {
+                        models[0].cube
+                    } else {
+                        None
+                    };
+                    if let Some(styles) = cube {
+                        for face in &models[0].faces {
+                            let Some(direction) = face.quad.cull else {
+                                // `cube_styles` guarantees this cannot occur;
+                                // keep a defensive fallback if the catalog changes.
+                                self.face(
+                                    &pad, &mut tints, &mut out, [x, y, z], origin, face, ao, state,
+                                );
+                                continue;
+                            };
+                            if !visible[direction as usize] {
                                 continue;
                             }
-                            self.face(
+                            let vertices = self.face_vertices(
                                 &pad,
                                 &mut tints,
-                                &mut out,
                                 [x, y, z],
                                 origin,
                                 face,
                                 ao,
                                 state,
                             );
+                            if !add_greedy_face(
+                                &mut greedy_faces,
+                                direction,
+                                [x, y, z],
+                                styles[direction as usize],
+                                &vertices,
+                            ) {
+                                // Non-uniform corner lighting cannot be
+                                // represented by one larger quad.
+                                out.solid.extend(vertices);
+                            }
+                        }
+                    } else {
+                        for model in &models {
+                            for face in &model.faces {
+                                if face.quad.cull.is_some_and(|d| !visible[d as usize]) {
+                                    continue;
+                                }
+                                self.face(
+                                    &pad,
+                                    &mut tints,
+                                    &mut out,
+                                    [x, y, z],
+                                    origin,
+                                    face,
+                                    ao,
+                                    state,
+                                );
+                            }
                         }
                     }
                 }
             }
         }
+        emit_greedy_faces(&mut out, greedy_faces);
         out
     }
     /// `BlockColors` tint source `index`, or `None` for an untinted (-1) layer.
@@ -863,6 +1110,24 @@ impl Mesher<'_> {
         ao: bool,
         state: &Info,
     ) {
+        let vertices = self.face_vertices(pad, tints, pos, origin, face, ao, state);
+        if face.translucent {
+            out.translucent.extend(vertices);
+        } else {
+            out.solid.extend(vertices);
+        }
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn face_vertices(
+        &self,
+        pad: &Padded,
+        tints: &mut Tints,
+        pos: [i32; 3],
+        origin: [f32; 3],
+        face: &BakedFace,
+        ao: bool,
+        state: &Info,
+    ) -> [TerrainVertex; 4] {
         let q = &face.quad;
         let shade_face = q.shade_direction_override.unwrap_or(q.facing);
         let directional = lighting::cardinal(self.nether_shading, shade_face);
@@ -881,19 +1146,14 @@ impl Mesher<'_> {
             ([lighting::gray(directional); 4], [coords; 4])
         };
         let tint = Self::tint(state, q.tint_index, tints, pos);
-        let target = if face.translucent {
-            &mut out.translucent
-        } else {
-            &mut out.solid
-        };
-        for i in 0..4 {
+        std::array::from_fn(|i| {
             let g = gray[i] as u32;
             let rgb = match tint {
                 Some(t) => [16, 8, 0].map(|shift| g * (t >> shift & 255) / 255),
                 None => [g; 3],
             };
             let p = q.positions[i];
-            target.push(TerrainVertex::new(
+            TerrainVertex::new(
                 [p[0] + origin[0], p[1] + origin[1], p[2] + origin[2]],
                 q.uv[i],
                 // Opaque leaves (forceOpaque) and quads over opaque texels draw in the
@@ -905,12 +1165,108 @@ impl Mesher<'_> {
                 },
                 emitting(pack_rgb(rgb), state.emission.max(q.light_emission)),
                 pack_coords(lighting::with_emission(coords[i], q.light_emission)),
-            ));
-        }
+            )
+        })
     }
 }
 /// Snapshot of the 3x3 chunk neighbourhood used by a worker job.
 pub type Region = [[Option<Arc<Chunk>>; 3]; 3];
 pub fn borrow(region: &Region) -> [[Option<&Chunk>; 3]; 3] {
     std::array::from_fn(|z| std::array::from_fn(|x| region[z][x].as_deref()))
+}
+
+#[cfg(test)]
+mod greedy_meshing_tests {
+    use super::*;
+
+    fn key(direction: GreedyDirection, layer: u16, color: u32, light: u16) -> GreedyKey {
+        GreedyKey {
+            direction: direction as u8,
+            plane: if positive_face(direction) { 1 } else { 0 },
+            layer,
+            uv: [0, 0, 1, 0, 0, 1],
+            color,
+            light,
+        }
+    }
+
+    fn tiled_uv(vertex: &TerrainVertex) -> [f32; 2] {
+        vertex.uv.map(|v| f32::from(v) / TILED_UV_STEPS)
+    }
+
+    #[test]
+    fn same_material_and_light_faces_merge_and_repeat_per_block() {
+        let mut faces = GreedyFaces::new();
+        let key = key(GreedyDirection::Up, 7, u32::MAX, 0xF0);
+        faces
+            .entry(key)
+            .or_default()
+            .extend((0..4).flat_map(|v| (0..4).map(move |u| (u, v))));
+
+        let mut mesh = SectionMesh::default();
+        emit_greedy_faces(&mut mesh, faces);
+
+        assert_eq!(mesh.solid.len(), 4, "a 4x4 surface is one quad");
+        assert!(mesh.translucent.is_empty());
+        assert!(mesh.solid.iter().all(|v| v.layer & TILED_UV_LAYER != 0));
+        assert!(mesh.solid.iter().all(|v| v.layer & 0x3fff == 7));
+        let uv = mesh.solid.iter().map(tiled_uv).collect::<Vec<_>>();
+        let range = |axis: usize| {
+            uv.iter().map(|v| v[axis]).fold(f32::NEG_INFINITY, f32::max)
+                - uv.iter().map(|v| v[axis]).fold(f32::INFINITY, f32::min)
+        };
+        assert_eq!([range(0), range(1)], [4.0, 4.0]);
+        let points = mesh.solid.iter().map(|v| v.pos).collect::<Vec<_>>();
+        assert!(points.iter().all(|p| p[1] == 1.0));
+    }
+
+    #[test]
+    fn material_and_light_boundaries_prevent_merging() {
+        let mut faces = GreedyFaces::new();
+        faces.entry(key(GreedyDirection::Up, 3, u32::MAX, 0xF0)).or_default().push((0, 0));
+        faces.entry(key(GreedyDirection::Up, 4, u32::MAX, 0xF0)).or_default().push((1, 0));
+        faces.entry(key(GreedyDirection::Up, 3, u32::MAX, 0x10)).or_default().push((2, 0));
+        let mut mesh = SectionMesh::default();
+        emit_greedy_faces(&mut mesh, faces);
+        assert_eq!(mesh.solid.len(), 12, "three incompatible faces remain separate");
+    }
+
+    #[test]
+    fn varying_corner_lighting_uses_the_original_quad() {
+        let mut vertices = [TerrainVertex::new([0.0; 3], [0.0; 2], 1, 10, 20); 4];
+        vertices[2].color = 11;
+        let mut faces = GreedyFaces::new();
+        assert!(!add_greedy_face(
+            &mut faces,
+            GreedyDirection::Up,
+            [0, 0, 0],
+            crate::models::CubeStyle {
+                layer: 1,
+                uv: [0, 0, 1, 0, 0, 1],
+                shade_bits: 1.0f32.to_bits(),
+            },
+            &vertices,
+        ));
+        assert!(faces.is_empty());
+    }
+
+    #[test]
+    fn greedy_rectangles_keep_each_direction_winding() {
+        for direction in GreedyDirection::ALL {
+            let mut mesh = SectionMesh::default();
+            emit_greedy_rect(&mut mesh, key(direction, 1, u32::MAX, 240), 2, 3, 2, 3);
+            let q: [TerrainVertex; 4] = mesh.solid.clone().try_into().unwrap();
+            let p = |i: usize| glam::Vec3::from(q[i].pos);
+            let normal = (p(1) - p(0)).cross(p(2) - p(0));
+            let wanted = glam::Vec3::from(match direction {
+                GreedyDirection::Down => [0.0, -1.0, 0.0],
+                GreedyDirection::Up => [0.0, 1.0, 0.0],
+                GreedyDirection::North => [0.0, 0.0, -1.0],
+                GreedyDirection::South => [0.0, 0.0, 1.0],
+                GreedyDirection::West => [-1.0, 0.0, 0.0],
+                GreedyDirection::East => [1.0, 0.0, 0.0],
+            });
+            assert!(normal.dot(wanted) > 0.0, "{direction:?}: {normal:?}");
+        }
+    }
 }

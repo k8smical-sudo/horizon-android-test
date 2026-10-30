@@ -24,6 +24,8 @@ struct Globals {
     outline_params: vec4<f32>,
     // Horizon Extras' dynamic lights: camera-relative position and level (dynamic_light.rs).
     dynamic_lights: array<vec4<f32>, 16>,
+    // RGB tint of each dynamic light, in the same order as dynamic_lights.
+    dynamic_light_colors: array<vec4<f32>, 16>,
     // The sunrise fan's 16 triangles (gfx/sunrise_fan.rs): xyz the apex weight's normal, w the
     // triangle's volume with the camera; then each rim vertex's normal against the apex.
     sunrise_fan: array<vec4<f32>, 32>,
@@ -87,6 +89,22 @@ fn dynamic_block_light(pos: vec3<f32>) -> f32 {
     }
     return level * 16.0;
 }
+// RGB contribution from the strongest nearby dynamic light. Distance falloff
+// follows the block-light level; tint is deliberately subtle to preserve texture colors.
+fn dynamic_light_tint(pos: vec3<f32>) -> vec4<f32> {
+    let count = min(u32(globals.time.z), 16u);
+    var best = 0.0;
+    var tint = vec3<f32>(1.0);
+    for (var i = 0u; i < count; i++) {
+        let l = globals.dynamic_lights[i];
+        let strength = max(0.0, l.w - distance(pos, l.xyz)) / 15.0;
+        if strength > best {
+            best = strength;
+            tint = globals.dynamic_light_colors[i].rgb;
+        }
+    }
+    return vec4(mix(vec3<f32>(1.0), tint, clamp(best * 0.72, 0.0, 0.72)), best);
+}
 fn sample_lightmap(sky: f32, block: f32) -> vec4<f32> {
     let uv = vec2(block, sky) * 16.0;
     return textureSampleLevel(lightmap, lightmap_sampler,
@@ -96,14 +114,18 @@ fn sample_lightmap(sky: f32, block: f32) -> vec4<f32> {
 // origin.w is the step: 1/32768 per unit for sections (a power of two on an
 // integer below 2^24, so it decodes exactly), 1/32 per block for distant
 // terrain tiles (TerrainVertex::tiled).
-fn terrain_uv(packed: vec2<u32>, step: f32) -> vec2<f32> {
-    return vec2<f32>(packed) * step;
+fn terrain_uv(packed: vec2<u32>, step: f32, layer: u32) -> vec2<f32> {
+    // Close-up greedy faces encode UVs at the same block scale as distant
+    // LOD faces, selected per vertex so ordinary model/fluid UVs keep their
+    // higher precision and the section instance layout remains unchanged.
+    let tiled_step = select(step, 1.0 / 32.0, (layer & 0x4000u) != 0u);
+    return vec2<f32>(packed) * tiled_step;
 }
 @vertex fn vs_terrain(
     @location(0) position: vec3<f32>, @location(1) uv: vec2<u32>,
     @location(2) layer: u32, @location(3) color: vec4<f32>, @location(4) light: vec2<u32>,
     @location(5) origin: vec4<f32>) -> TerrainOut {
-    return terrain_vertex(position, terrain_uv(uv, origin.w), layer, color, light, origin.xyz);
+    return terrain_vertex(position, terrain_uv(uv, origin.w, layer), layer, color, light, origin.xyz);
 }
 // Flat section draws (gfx/flat.rs): one draw per arena page over the frame's
 // index list. A section's vertices fill whole 256-vertex blocks of its page:
@@ -116,7 +138,7 @@ fn terrain_uv(packed: vec2<u32>, step: f32) -> vec2<f32> {
     @location(2) layer: u32, @location(3) color: vec4<f32>, @location(4) light: vec2<u32>
 ) -> TerrainOut {
     let origin = slot_origins[block_slots[vertex >> 8u]];
-    return terrain_vertex(position, terrain_uv(uv, origin.w), layer, color, light, origin.xyz);
+    return terrain_vertex(position, terrain_uv(uv, origin.w, layer), layer, color, light, origin.xyz);
 }
 fn terrain_vertex(position: vec3<f32>, uv: vec2<f32>, layer: u32, color: vec4<f32>,
     light: vec2<u32>, origin: vec3<f32>) -> TerrainOut {
@@ -126,7 +148,8 @@ fn terrain_vertex(position: vec3<f32>, uv: vec2<f32>, layer: u32, color: vec4<f3
     out.uv = uv;
     out.layer = layer;
     let block = max(f32(light.y), dynamic_block_light(pos));
-    out.color = vec4(color.rgb, 1.0) * sample_lightmap(f32(light.x) / 16.0, block / 16.0);
+    let rgb_light = dynamic_light_tint(pos);
+    out.color = vec4(color.rgb * rgb_light.rgb, 1.0) * sample_lightmap(f32(light.x) / 16.0, block / 16.0);
     out.emission = 15u - (u32(round(color.a * 255.0)) & 15u);
     out.spherical = length(pos);
     out.cylindrical = max(length(pos.xz), abs(pos.y));
@@ -144,7 +167,7 @@ fn apply_fog(color: vec4<f32>, spherical: f32, cylindrical: f32) -> vec4<f32> {
 }
 @fragment fn fs_solid(in: TerrainOut) -> @location(0) vec4<f32> {
     // Bit 15 of the layer marks opaque leaves (forceOpaque): no alpha cutout.
-    let color = sprite(in.uv, in.layer & 0x7fffu) * in.color;
+    let color = sprite(in.uv, in.layer & 0x3fffu) * in.color;
     if color.a < 0.5 && (in.layer & 0x8000u) == 0u { discard; }
     // Alpha 0 tells HDR output (hdr.wgsl) a light-emitting block's bright pixels
     // may shine. Nothing else reads the frame's alpha.
@@ -152,7 +175,7 @@ fn apply_fog(color: vec4<f32>, spherical: f32, cylindrical: f32) -> vec4<f32> {
     return apply_fog(vec4(color.rgb, emissive), in.spherical, in.cylindrical);
 }
 @fragment fn fs_translucent(in: TerrainOut) -> @location(0) vec4<f32> {
-    let color = sprite(in.uv, in.layer & 0x7fffu) * in.color;
+    let color = sprite(in.uv, in.layer & 0x3fffu) * in.color;
     if color.a < 0.01 { discard; }
     return apply_fog(color, in.spherical, in.cylindrical);
 }

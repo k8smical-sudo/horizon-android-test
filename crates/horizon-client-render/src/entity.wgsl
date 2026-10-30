@@ -22,6 +22,8 @@ struct Globals {
     outline_params: vec4<f32>,
     // Horizon Extras' dynamic lights: camera-relative position and level (dynamic_light.rs).
     dynamic_lights: array<vec4<f32>, 16>,
+    // RGB tint of each dynamic light, in the same order as dynamic_lights.
+    dynamic_light_colors: array<vec4<f32>, 16>,
     sunrise_fan: array<vec4<f32>, 32>,
 }
 @group(0) @binding(0) var<uniform> globals: Globals;
@@ -86,6 +88,22 @@ fn dynamic_block_light(pos: vec3<f32>) -> f32 {
     }
     return level * 16.0;
 }
+// RGB contribution from the strongest nearby dynamic light. Distance falloff
+// follows the block-light level; tint is deliberately subtle to preserve texture colors.
+fn dynamic_light_tint(pos: vec3<f32>) -> vec4<f32> {
+    let count = min(u32(globals.time.z), 16u);
+    var best = 0.0;
+    var tint = vec3<f32>(1.0);
+    for (var i = 0u; i < count; i++) {
+        let l = globals.dynamic_lights[i];
+        let strength = max(0.0, l.w - distance(pos, l.xyz)) / 15.0;
+        if strength > best {
+            best = strength;
+            tint = globals.dynamic_light_colors[i].rgb;
+        }
+    }
+    return vec4(mix(vec3<f32>(1.0), tint, clamp(best * 0.72, 0.0, 0.72)), best);
+}
 fn entity_vertex(position: vec3<f32>, uv: vec2<f32>,
     overlay: u32, color: vec4<f32>, light: vec4<u32>, normal: vec4<f32>) -> Out {
     var out: Out;
@@ -98,7 +116,8 @@ fn entity_vertex(position: vec3<f32>, uv: vec2<f32>,
     // Celestial bodies, clouds, beacon beams, End portals and breaking cracks are unlit.
     let unlit = overlay == 2u || overlay == 4u || overlay == 6u || overlay == 9u || overlay == 10u
         || overlay == 11u || overlay == 12u;
-    out.light_color = select(lm, vec4(1.0), unlit);
+    let rgb_light = dynamic_light_tint(position);
+    out.light_color = select(vec4(lm.rgb * rgb_light.rgb, lm.a), vec4(1.0), unlit);
     // Overlay 6 (beacon beams): the light bytes carry the sprite's v range; 11 and 12
     // (cracks): the destroy stage sprite's origin.
     out.wrap = vec2(f32(light.x | (light.y << 8u)), f32(light.z | (light.w << 8u))) / 65535.0;

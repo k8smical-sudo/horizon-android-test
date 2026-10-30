@@ -76,7 +76,12 @@ impl Bounds {
         let min = origin + self.min.as_dvec3();
         let max = origin + self.max.as_dvec3();
         let nearest = DVec3::ZERO.clamp(min, max);
-        if nearest.x * nearest.x + nearest.z * nearest.z > f64::from(distance).powi(2)
+        // Compare squared distances without `powi` in this hot per-tile path.
+        // `distance` is non-negative at the renderer boundary; clamp defensively
+        // here so malformed settings cannot turn the radius into a negative value.
+        let distance_sq = f64::from(distance.max(0.0));
+        let distance_sq = distance_sq * distance_sq;
+        if nearest.x * nearest.x + nearest.z * nearest.z > distance_sq
             || !frustum.intersects(min.as_vec3(), max.as_vec3())
         {
             return None;
