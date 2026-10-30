@@ -1,0 +1,65 @@
+# Manual APK build for testing. Produces a public-mode APK as a downloadable
+# workflow artifact. Not a release: nothing is published to Releases.
+name: Android APK build
+on:
+  workflow_dispatch:
+    inputs:
+      abi:
+        description: Target ABI
+        type: choice
+        options: [arm64-v8a, armeabi-v7a, x86, x86_64]
+        default: arm64-v8a
+      profile:
+        description: Cargo profile (fast builds quicker)
+        type: choice
+        options: [fast, release]
+        default: fast
+permissions:
+  contents: read
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    env:
+      HORIZON_TELEMETRY_URL: "off"
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Android SDK packages
+        run: |
+          yes | sdkmanager --licenses > /dev/null
+          sdkmanager "platforms;android-35" "build-tools;35.0.0" "ndk;28.2.13676358"
+
+      - name: Install Gradle 8.14
+        run: |
+          curl -fsSL -o /tmp/gradle.zip https://services.gradle.org/distributions/gradle-8.14-bin.zip
+          sudo unzip -q /tmp/gradle.zip -d /opt
+          echo "GRADLE=/opt/gradle-8.14/bin/gradle" >> "$GITHUB_ENV"
+
+      - name: Rust Android targets
+        run: |
+          rustup target add aarch64-linux-android armv7-linux-androideabi i686-linux-android x86_64-linux-android
+
+      - name: Prepare engine data from Mojang's pinned downloads
+        run: python3 tools/android_prepare.py
+
+      - name: Build and audit the public APK
+        run: |
+          python3 tools/android_build.py \
+            --abi "${{ inputs.abi }}" \
+            --public \
+            --profile "${{ inputs.profile }}" \
+            --sdk "$ANDROID_HOME" \
+            --java-home "$JAVA_HOME_17_X64" \
+            --gradle "$GRADLE"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: horizon-android-${{ inputs.abi }}-${{ inputs.profile }}
+          path: .local/android/apk/${{ inputs.abi }}/horizon-android-public.apk
+          if-no-files-found: error
+          retention-days: 7
